@@ -1,0 +1,8 @@
+config agent 'main'
+	option enabled '1'
+	option api_url 'https://31.76.34.16:8443'
+	option tls_insecure '1'
+	option install_token ''
+	option device_id ''
+	option device_token ''
+	option interval '30'

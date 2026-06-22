@@ -1,0 +1,16 @@
+[Unit]
+Description=NISIA OpenWrt Agent Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/nisia-agent-server/backend
+EnvironmentFile=/etc/nisia-agent-server.env
+ExecStart=/opt/nisia-agent-server/venv/bin/uvicorn nisia_agent_server.app:app --host 127.0.0.1 --port 8443 --ssl-keyfile /opt/nisia-agent-server/tls/key.pem --ssl-certfile /opt/nisia-agent-server/tls/cert.pem
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

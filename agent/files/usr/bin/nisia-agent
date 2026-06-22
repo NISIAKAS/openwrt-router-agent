@@ -1,0 +1,264 @@
+#!/bin/sh
+
+VERSION="0.1.2"
+CONFIG="nisia_agent.main"
+STATE_DIR="/tmp/nisia-agent"
+LOG_TAG="nisia-agent"
+
+log() {
+	logger -t "$LOG_TAG" "$*"
+}
+
+uci_get() {
+	uci -q get "$CONFIG.$1" 2>/dev/null || true
+}
+
+uci_set() {
+	uci set "$CONFIG.$1=$2"
+}
+
+enabled() {
+	[ "$(uci_get enabled)" = "1" ]
+}
+
+curl_common_args() {
+	if [ "$(uci_get tls_insecure)" = "1" ]; then
+		printf '%s\n' "-k"
+	fi
+}
+
+api_url() {
+	uci_get api_url | sed 's#/$##'
+}
+
+json_string() {
+	jq -Rn --arg v "$1" '$v'
+}
+
+cmd_text() {
+	sh -c "$1" 2>&1 | sed -E \
+		-e 's/(option[[:space:]]+(key|secret|password|private_key|preshared_key|token)[[:space:]]+).*/\1 REDACTED/I' \
+		-e 's/([A-Za-z0-9_+-]{20,}=*)/REDACTED/g'
+}
+
+snapshot_json() {
+	board="$(ubus call system board 2>/dev/null || echo '{}')"
+	hostname="$(uci -q get system.@system[0].hostname 2>/dev/null || hostname 2>/dev/null || echo OpenWrt)"
+	openwrt_version="$(echo "$board" | jq -r '.release.description // empty' 2>/dev/null)"
+	model="$(echo "$board" | jq -r '.model // empty' 2>/dev/null)"
+	wan_ip="$(ip -4 addr show dev "$(uci -q get network.wan.device 2>/dev/null || echo wan)" 2>/dev/null | awk '/inet / {print $2; exit}')"
+
+	jq -n \
+		--arg agent_version "$VERSION" \
+		--arg hostname "$hostname" \
+		--arg model "$model" \
+		--arg openwrt_version "$openwrt_version" \
+		--arg wan_ip "$wan_ip" \
+		--arg board_text "$board" \
+		--arg network "$(cmd_text 'uci show network')" \
+		--arg firewall "$(cmd_text 'uci show firewall')" \
+		--arg dhcp "$(cmd_text 'uci show dhcp')" \
+		--arg wireless "$(cmd_text 'uci show wireless')" \
+		--arg routes "$(cmd_text 'ip route show; ip rule show')" \
+		--arg ifaces "$(cmd_text 'ip -br addr')" \
+		--arg packages "$(cmd_text 'apk list --installed 2>/dev/null || opkg list-installed 2>/dev/null || true')" \
+		'{
+			agent_version: $agent_version,
+			hostname: $hostname,
+			model: $model,
+			openwrt_version: $openwrt_version,
+			wan_ip: $wan_ip,
+			board: ($board_text | fromjson? // {}),
+			network_uci: $network,
+			firewall_uci: $firewall,
+			dhcp_uci: $dhcp,
+			wireless_uci: $wireless,
+			routes: $routes,
+			interfaces: $ifaces,
+			packages: $packages
+		}'
+}
+
+register_device() {
+	device_id="$(uci_get device_id)"
+	device_token="$(uci_get device_token)"
+	[ -n "$device_id" ] && [ -n "$device_token" ] && return 0
+
+	install_token="$(uci_get install_token)"
+	[ -n "$install_token" ] || {
+		log "install_token is empty; cannot register"
+		return 1
+	}
+
+	snap="$(snapshot_json)"
+	hostname="$(echo "$snap" | jq -r '.hostname')"
+	model="$(echo "$snap" | jq -r '.model')"
+	openwrt_version="$(echo "$snap" | jq -r '.openwrt_version')"
+	payload="$(jq -n \
+		--arg install_token "$install_token" \
+		--arg hostname "$hostname" \
+		--arg model "$model" \
+		--arg openwrt_version "$openwrt_version" \
+		--arg agent_version "$VERSION" \
+		'{install_token:$install_token,hostname:$hostname,model:$model,openwrt_version:$openwrt_version,agent_version:$agent_version,capabilities:["heartbeat","snapshot","tasks","self_update"]}')"
+
+	args="$(curl_common_args)"
+	response="$(curl $args -fsS -X POST "$(api_url)/api/v1/register" -H 'Content-Type: application/json' -d "$payload")" || {
+		log "registration failed"
+		return 1
+	}
+
+	device_id="$(echo "$response" | jq -r '.device_id // empty')"
+	device_token="$(echo "$response" | jq -r '.device_token // empty')"
+	[ -n "$device_id" ] && [ -n "$device_token" ] || {
+		log "registration response missing device credentials"
+		return 1
+	}
+
+	uci_set device_id "$device_id"
+	uci_set device_token "$device_token"
+	uci commit nisia_agent
+	log "registered device $device_id"
+}
+
+auth_header() {
+	printf 'Authorization: Bearer %s\n' "$(uci_get device_token)"
+}
+
+post_heartbeat() {
+	snap="$(snapshot_json)"
+	payload="$(jq -n \
+		--arg agent_version "$VERSION" \
+		--arg openwrt_version "$(echo "$snap" | jq -r '.openwrt_version')" \
+		--arg wan_ip "$(echo "$snap" | jq -r '.wan_ip')" \
+		'{agent_version:$agent_version,openwrt_version:$openwrt_version,wan_ip:$wan_ip,capabilities:["heartbeat","snapshot","tasks","self_update"]}')"
+	args="$(curl_common_args)"
+	curl $args -fsS -X POST "$(api_url)/api/v1/devices/$(uci_get device_id)/heartbeat" \
+		-H "$(auth_header)" -H 'Content-Type: application/json' -d "$payload" >/dev/null
+}
+
+post_snapshot() {
+	snap="$(snapshot_json)"
+	payload="$(jq -n --argjson snapshot "$snap" '{snapshot:$snapshot}')"
+	args="$(curl_common_args)"
+	curl $args -fsS -X POST "$(api_url)/api/v1/devices/$(uci_get device_id)/snapshot" \
+		-H "$(auth_header)" -H 'Content-Type: application/json' -d "$payload" >/dev/null
+}
+
+send_task_result() {
+	task_id="$1"
+	status="$2"
+	error="$3"
+	output_name="${4:-}"
+	case "$output_name" in
+		snapshot_sent)
+			output='{"snapshot_sent":true}'
+			;;
+		updated)
+			output='{"updated":true}'
+			;;
+		*)
+			output='{}'
+			;;
+	esac
+	payload="$(printf '%s' "$output" | jq -c --arg status "$status" --arg error "$error" '{status:$status,error:$error,output:.}')"
+	args="$(curl_common_args)"
+	curl $args -fsS -X POST "$(api_url)/api/v1/devices/$(uci_get device_id)/tasks/$task_id/result" \
+		-H "$(auth_header)" -H 'Content-Type: application/json' -d "$payload" >/dev/null || true
+}
+
+self_update() {
+	task_id="$1"
+	payload="$2"
+	url="$(echo "$payload" | jq -r '.script_url // empty')"
+	sha256="$(echo "$payload" | jq -r '.sha256 // empty')"
+	[ -n "$url" ] || {
+		send_task_result "$task_id" failed "script_url is required"
+		return 1
+	}
+	tmp="/tmp/nisia-agent.update.$$"
+	args="$(curl_common_args)"
+	curl $args -fsS "$url" -o "$tmp" || {
+		rm -f "$tmp"
+		send_task_result "$task_id" failed "download failed"
+		return 1
+	}
+	if [ -n "$sha256" ]; then
+		got="$(sha256sum "$tmp" | awk '{print $1}')"
+		[ "$got" = "$sha256" ] || {
+			rm -f "$tmp"
+			send_task_result "$task_id" failed "sha256 mismatch"
+			return 1
+		}
+	fi
+	chmod +x "$tmp"
+	mv "$tmp" /usr/bin/nisia-agent
+	send_task_result "$task_id" done "" updated
+	(sleep 1; /etc/init.d/nisia-agent restart) >/dev/null 2>&1 &
+	exit 0
+}
+
+execute_task() {
+	task="$1"
+	task_id="$(echo "$task" | jq -r '.id')"
+	task_type="$(echo "$task" | jq -r '.type')"
+	payload="$(echo "$task" | jq -c '.payload // {}')"
+
+	case "$task_type" in
+		collect_snapshot)
+			post_snapshot && send_task_result "$task_id" done "" snapshot_sent || send_task_result "$task_id" failed "snapshot failed"
+			;;
+		self_update)
+			self_update "$task_id" "$payload"
+			;;
+		install_remote_wg)
+			send_task_result "$task_id" failed "install_remote_wg is not implemented in agent 0.1.0"
+			;;
+		*)
+			send_task_result "$task_id" failed "unsupported task type"
+			;;
+	esac
+}
+
+poll_task() {
+	args="$(curl_common_args)"
+	response="$(curl $args -fsS "$(api_url)/api/v1/devices/$(uci_get device_id)/tasks/next" -H "$(auth_header)")" || return 1
+	task="$(echo "$response" | jq -c '.task // empty')"
+	[ -n "$task" ] && [ "$task" != "null" ] || return 0
+	execute_task "$task"
+}
+
+run_once() {
+	enabled || {
+		log "disabled"
+		return 0
+	}
+	mkdir -p "$STATE_DIR"
+	register_device || return 1
+	post_heartbeat || log "heartbeat failed"
+	post_snapshot || log "snapshot failed"
+	poll_task || log "task polling failed"
+}
+
+daemon() {
+	while true; do
+		run_once
+		sleep "$(uci_get interval | grep -E '^[0-9]+$' || echo 30)"
+	done
+}
+
+case "${1:-run_once}" in
+	daemon)
+		daemon
+		;;
+	run_once)
+		run_once
+		;;
+	snapshot)
+		snapshot_json
+		;;
+	*)
+		echo "usage: $0 [daemon|run_once|snapshot]" >&2
+		exit 2
+		;;
+esac
