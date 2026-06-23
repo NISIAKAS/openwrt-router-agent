@@ -7,7 +7,7 @@ Minimal outbound control-plane for OpenWrt routers.
 Primary server-hosted install:
 
 ```sh
-sh -c "$(wget -O - https://kasplex.ru/install.sh)"
+sh -c "$(wget -O - https://kasplex.store/install.sh)"
 ```
 
 Fallback GitHub install:

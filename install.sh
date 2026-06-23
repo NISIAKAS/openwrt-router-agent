@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-API_URL="${NISIA_API_URL:-https://kasplex.ru}"
+API_URL="${NISIA_API_URL:-https://kasplex.store}"
 INSTALL_TOKEN="${NISIA_INSTALL_TOKEN:-public}"
 INTERVAL="${NISIA_INTERVAL:-30}"
 TLS_INSECURE="${NISIA_TLS_INSECURE:-0}"
